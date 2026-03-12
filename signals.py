@@ -12,14 +12,31 @@ from config import (
     STOP_LOSS_PCT, TP1_RR, TP2_RR, LEVERAGE, PRINT_DEBUG,
 )
 
+# Global cooldown tracker: {(symbol, side, rounded_price): last_alert_ts}
+_alert_cooldowns: dict[tuple, float] = {}
+_signal_cooldowns: dict[tuple, float] = {}
+
+ALERT_COOLDOWN = 600   # 10 min between approaching alerts for same level
+SIGNAL_COOLDOWN = 1800  # 30 min between signals for same level
+
+
+def _level_key(symbol: str, lvl: Level) -> tuple:
+    """Create a unique key for a level based on symbol, side, and rounded price."""
+    # Round price to reduce noise - group nearby prices
+    precision = max(lvl.price * 0.002, 1e-8)  # 0.2% bucket
+    rounded = round(lvl.price / precision) * precision
+    return (symbol, lvl.side, rounded)
+
 
 async def process_levels(symbol: str, price: float, levels: List[Level],
                          ctx: CandleContext) -> None:
     """Check each level state and send alerts/signals."""
     now = time.time()
+
     for lvl in levels:
         dist = abs(price - lvl.price) / max(price, 1e-9)
         calc_strength(lvl)
+        key = _level_key(symbol, lvl)
 
         # Reset far away levels
         if dist > LEVEL_FAR_PCT:
@@ -27,26 +44,39 @@ async def process_levels(symbol: str, price: float, levels: List[Level],
                 lvl.state = "FAR"
             continue
 
-        # FAR -> NEAR
+        # Skip already signalled levels (until they go FAR and come back)
+        if lvl.state == "SIGNALLED":
+            continue
+
+        # FAR -> NEAR (approaching alert)
         if lvl.state == "FAR" and dist <= LEVEL_NEAR_PCT:
             if lvl.strength >= LEVEL_MIN_STRENGTH:
-                lvl.state = "NEAR"
-                await send_approaching(
-                    symbol, lvl.side, lvl.price,
-                    lvl.volume_usdt, dist, lvl.strength,
-                )
-                if PRINT_DEBUG:
-                    print(f"[NEAR] {symbol} {lvl.side} {lvl.price:.4f}")
+                # Check alert cooldown
+                last_alert = _alert_cooldowns.get(key, 0)
+                if now - last_alert >= ALERT_COOLDOWN:
+                    lvl.state = "NEAR"
+                    _alert_cooldowns[key] = now
+                    await send_approaching(
+                        symbol, lvl.side, lvl.price, lvl.volume_usdt,
+                        dist, lvl.strength,
+                    )
+                    if PRINT_DEBUG:
+                        print(f"[NEAR] {symbol} {lvl.side} {lvl.price:.4f}")
+                else:
+                    lvl.state = "NEAR"  # Update state but don't alert
 
-        # NEAR -> TOUCHED -> try signal
-        if lvl.state in ("NEAR", "FAR") and dist <= LEVEL_TOUCH_PCT:
+        # NEAR -> TOUCHED
+        if lvl.state == "NEAR" and dist <= LEVEL_TOUCH_PCT:
             lvl.state = "TOUCHED"
             if PRINT_DEBUG:
                 print(f"[TOUCH] {symbol} {lvl.side} {lvl.price:.4f}")
 
+        # TOUCHED -> try signal
         if lvl.state == "TOUCHED":
-            # Cooldown check
-            if now - lvl.last_signal_ts < LEVEL_COOLDOWN_SEC:
+            # Check signal cooldown
+            last_sig = _signal_cooldowns.get(key, 0)
+            if now - last_sig < SIGNAL_COOLDOWN:
+                lvl.state = "SIGNALLED"  # Block further attempts
                 continue
 
             direction = "LONG" if lvl.side == "bid" else "SHORT"
@@ -54,8 +84,14 @@ async def process_levels(symbol: str, price: float, levels: List[Level],
             # Liquidation filter
             if USE_LIQUIDATION_FILTER:
                 if direction == "LONG" and lvl.liq_short_usdt < LIQ_MIN_USDT:
+                    if PRINT_DEBUG:
+                        print(f"[FILTER] {symbol} {direction} no liq support")
+                    lvl.state = "SIGNALLED"  # Don't retry
                     continue
                 if direction == "SHORT" and lvl.liq_long_usdt < LIQ_MIN_USDT:
+                    if PRINT_DEBUG:
+                        print(f"[FILTER] {symbol} {direction} no liq support")
+                    lvl.state = "SIGNALLED"
                     continue
 
             # Candle / trend / volatility filters
@@ -63,6 +99,7 @@ async def process_levels(symbol: str, price: float, levels: List[Level],
             if not passed:
                 if PRINT_DEBUG:
                     print(f"[FILTER] {symbol} {direction} rejected: {reason}")
+                lvl.state = "SIGNALLED"  # Don't retry same level
                 continue
 
             # Calculate SL / TP
@@ -86,7 +123,10 @@ async def process_levels(symbol: str, price: float, levels: List[Level],
                 tp1=tp1, tp2=tp2, reason=reason,
                 risk_pct=risk_pct, leverage=LEVERAGE,
             )
+
             lvl.state = "SIGNALLED"
             lvl.last_signal_ts = now
+            _signal_cooldowns[key] = now
+
             if PRINT_DEBUG:
                 print(f"[SIGNAL] {symbol} {direction} @ {entry:.4f}")
