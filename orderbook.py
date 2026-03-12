@@ -1,13 +1,17 @@
-"""Order book management + deep REST fetcher with direct + proxy fallback."""
+"""Order book management + deep REST fetcher with multi-endpoint fallback."""
 from __future__ import annotations
 import httpx
 from proxy_pool import proxy_pool
 from config import PRINT_DEBUG
 
-# Use futures API (fapi) as primary - works from most locations
+# Multiple Binance API endpoints to try (futures first, then spot mirrors)
 DEPTH_URLS = [
     "https://fapi.binance.com/fapi/v1/depth",
-    "https://api.binance.com/api/v3/depth",
+    "https://api1.binance.com/api/v3/depth",
+    "https://api2.binance.com/api/v3/depth",
+    "https://api3.binance.com/api/v3/depth",
+    "https://api4.binance.com/api/v3/depth",
+    "https://data-api.binance.vision/api/v3/depth",
 ]
 
 
@@ -60,13 +64,39 @@ def _parse_depth(data: dict) -> tuple[dict, dict] | None:
     return None
 
 
+# Track which endpoint works to avoid retrying broken ones
+_working_url: str | None = None
+
+
 async def fetch_deep_orderbook(symbol: str, limit: int = 1000) -> tuple[dict, dict]:
-    """Fetch deep order book - try direct first, then proxy fallback.
+    """Fetch deep order book via multiple Binance endpoints.
+    Tries direct first (all mirrors), then proxy fallback.
     Returns (bids_dict, asks_dict) where key=price, value=qty.
     """
+    global _working_url
     params = {"symbol": symbol.upper(), "limit": limit}
 
-    # 1. Try DIRECT first (works from Railway us-west2)
+    # 1. If we found a working URL before, try it first
+    if _working_url:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(_working_url, params=params)
+                data = resp.json()
+                result = _parse_depth(data)
+                if result:
+                    if PRINT_DEBUG:
+                        print(f"[DEPTH] {symbol}: {len(result[0])} bids, {len(result[1])} asks (cached)")
+                    return result
+                else:
+                    if PRINT_DEBUG:
+                        print(f"[DEPTH] {symbol} cached URL bad response: {str(data)[:100]}")
+                    _working_url = None
+        except Exception as e:
+            if PRINT_DEBUG:
+                print(f"[DEPTH] {symbol} cached URL error: {e}")
+            _working_url = None
+
+    # 2. Try ALL direct URLs
     for url in DEPTH_URLS:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
@@ -74,14 +104,21 @@ async def fetch_deep_orderbook(symbol: str, limit: int = 1000) -> tuple[dict, di
                 data = resp.json()
                 result = _parse_depth(data)
                 if result:
+                    _working_url = url
                     if PRINT_DEBUG:
-                        print(f"[DEPTH] {symbol}: {len(result[0])} bids, {len(result[1])} asks (direct)")
+                        host = url.split('/')[2]
+                        print(f"[DEPTH] {symbol}: {len(result[0])} bids, {len(result[1])} asks (direct:{host})")
                     return result
+                else:
+                    if PRINT_DEBUG:
+                        host = url.split('/')[2]
+                        print(f"[DEPTH] {symbol} {host}: {str(data)[:100]}")
         except Exception as e:
             if PRINT_DEBUG:
-                print(f"[DEPTH] {symbol} direct error ({url.split('/')[2]}): {e}")
+                host = url.split('/')[2]
+                print(f"[DEPTH] {symbol} {host}: {type(e).__name__}: {e}")
 
-    # 2. Fallback to PROXY if direct fails
+    # 3. Fallback to PROXY
     for attempt in range(2):
         proxy_url = await proxy_pool.get()
         if not proxy_url:
@@ -96,8 +133,6 @@ async def fetch_deep_orderbook(symbol: str, limit: int = 1000) -> tuple[dict, di
                         print(f"[DEPTH] {symbol}: {len(result[0])} bids, {len(result[1])} asks (proxy)")
                     return result
                 else:
-                    if PRINT_DEBUG:
-                        print(f"[DEPTH] {symbol}: bad proxy response: {str(data)[:80]}")
                     proxy_pool.remove(proxy_url)
         except Exception as e:
             if PRINT_DEBUG:
