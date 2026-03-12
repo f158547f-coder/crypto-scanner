@@ -1,10 +1,14 @@
-"""Order book management + deep REST fetcher with proxy support."""
+"""Order book management + deep REST fetcher with direct + proxy fallback."""
 from __future__ import annotations
 import httpx
 from proxy_pool import proxy_pool
 from config import PRINT_DEBUG
 
-DEPTH_URL = "https://api.binance.com/api/v3/depth"
+# Use futures API (fapi) as primary - works from most locations
+DEPTH_URLS = [
+    "https://fapi.binance.com/fapi/v1/depth",
+    "https://api.binance.com/api/v3/depth",
+]
 
 
 class OrderBook:
@@ -47,51 +51,58 @@ class OrderBook:
         return sorted(self.asks.items())[:n]
 
 
-async def fetch_deep_orderbook(symbol: str, limit: int = 5000) -> tuple[dict, dict]:
-    """Fetch deep order book via Binance spot REST API through proxy.
+def _parse_depth(data: dict) -> tuple[dict, dict] | None:
+    """Parse bids/asks from Binance depth response."""
+    if "bids" in data and "asks" in data:
+        bids = {float(p): float(q) for p, q in data["bids"] if float(q) > 0}
+        asks = {float(p): float(q) for p, q in data["asks"] if float(q) > 0}
+        return bids, asks
+    return None
 
+
+async def fetch_deep_orderbook(symbol: str, limit: int = 1000) -> tuple[dict, dict]:
+    """Fetch deep order book - try direct first, then proxy fallback.
     Returns (bids_dict, asks_dict) where key=price, value=qty.
-    Uses proxy pool to bypass geo-restrictions.
     """
     params = {"symbol": symbol.upper(), "limit": limit}
 
-    # Try with proxy first
-    for attempt in range(3):
-        proxy_url = await proxy_pool.get()
-        if proxy_url:
-            try:
-                async with httpx.AsyncClient(proxy=proxy_url, timeout=15) as client:
-                    resp = await client.get(DEPTH_URL, params=params)
-                    data = resp.json()
-                    if "bids" in data and "asks" in data:
-                        bids = {float(p): float(q) for p, q in data["bids"] if float(q) > 0}
-                        asks = {float(p): float(q) for p, q in data["asks"] if float(q) > 0}
-                        if PRINT_DEBUG:
-                            print(f"[DEPTH] {symbol}: {len(bids)} bids, {len(asks)} asks (proxy)")
-                        return bids, asks
-                    else:
-                        if PRINT_DEBUG:
-                            print(f"[DEPTH] {symbol}: bad response via proxy: {str(data)[:80]}")
-                        proxy_pool.remove(proxy_url)
-            except Exception as e:
-                if PRINT_DEBUG:
-                    print(f"[DEPTH] {symbol} proxy error: {e}")
-                if proxy_url:
-                    proxy_pool.remove(proxy_url)
+    # 1. Try DIRECT first (works from Railway us-west2)
+    for url in DEPTH_URLS:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(url, params=params)
+                data = resp.json()
+                result = _parse_depth(data)
+                if result:
+                    if PRINT_DEBUG:
+                        print(f"[DEPTH] {symbol}: {len(result[0])} bids, {len(result[1])} asks (direct)")
+                    return result
+        except Exception as e:
+            if PRINT_DEBUG:
+                print(f"[DEPTH] {symbol} direct error ({url.split('/')[2]}): {e}")
 
-    # Fallback: try direct (works if not geo-blocked)
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(DEPTH_URL, params=params)
-            data = resp.json()
-            if "bids" in data and "asks" in data:
-                bids = {float(p): float(q) for p, q in data["bids"] if float(q) > 0}
-                asks = {float(p): float(q) for p, q in data["asks"] if float(q) > 0}
-                if PRINT_DEBUG:
-                    print(f"[DEPTH] {symbol}: {len(bids)} bids, {len(asks)} asks (direct)")
-                return bids, asks
-    except Exception as e:
-        if PRINT_DEBUG:
-            print(f"[DEPTH] {symbol} direct error: {e}")
+    # 2. Fallback to PROXY if direct fails
+    for attempt in range(2):
+        proxy_url = await proxy_pool.get()
+        if not proxy_url:
+            break
+        try:
+            async with httpx.AsyncClient(proxy=proxy_url, timeout=15) as client:
+                resp = await client.get(DEPTH_URLS[0], params=params)
+                data = resp.json()
+                result = _parse_depth(data)
+                if result:
+                    if PRINT_DEBUG:
+                        print(f"[DEPTH] {symbol}: {len(result[0])} bids, {len(result[1])} asks (proxy)")
+                    return result
+                else:
+                    if PRINT_DEBUG:
+                        print(f"[DEPTH] {symbol}: bad proxy response: {str(data)[:80]}")
+                    proxy_pool.remove(proxy_url)
+        except Exception as e:
+            if PRINT_DEBUG:
+                print(f"[DEPTH] {symbol} proxy error: {e}")
+            if proxy_url:
+                proxy_pool.remove(proxy_url)
 
     return {}, {}
