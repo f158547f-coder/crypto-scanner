@@ -15,6 +15,7 @@ from wall_detector import Wall, get_tracker
 from ai_filter import filter_signal as ai_filter_signal
 from telegram_bot import send_tc_signal
 from config import PRINT_DEBUG
+from whale_filter import check_whale_filter
 
 # --- Config ---
 TC_APPROACH_PCT = 0.005   # Price within 0.5% of wall = approaching
@@ -257,6 +258,14 @@ async def check_tc_signals(
             _tc_cooldowns[key] = now
             continue
 
+                # WhalePortal filter
+        whale_passed, whale_reason, whale_summary = await check_whale_filter(symbol, direction)
+        if not whale_passed:
+            if PRINT_DEBUG:
+                print(f"[TC WHALE REJECT] {symbol} {direction}: {whale_reason}")
+            wall.signalled = True
+            _tc_cooldowns[key] = now
+            continue
         # Apply AI corrections if any
         if ai_result and ai_result.get("corrected", False):
             direction = ai_result.get("direction", direction)
@@ -281,6 +290,7 @@ async def check_tc_signals(
             vol_ratio=best_vol_ratio,
             risk_pct=risk_pct,
             leverage=20,
+                        whale_summary=whale_summary,
         )
 
         wall.signalled = True
