@@ -18,6 +18,7 @@ from levels import build_levels, Level, calc_strength
 from liquidations import LiquidationTracker
 from context_candles import CandleContext
 from signals import process_levels
+from tc_signals import check_tc_signals
 from config import (BINANCE_WS_URL, SYMBOLS, CANDLE_FETCH_INTERVAL,
                     PRINT_DEBUG, LEVEL_MERGE_PCT)
 from telegram_bot import send_telegram
@@ -127,6 +128,7 @@ class MarketScanner:
                         new_levels = _merge_state(old_levels, new_levels)
                     self.levels_by_sym[sym] = new_levels
                     await process_levels(sym, price, new_levels, self.candle_ctx)
+                                      await check_tc_signals(sym, price, bids, asks)
                 except Exception as e:
                     if PRINT_DEBUG:
                         print(f"[CHECK] error {sym}: {e}")
