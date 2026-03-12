@@ -36,8 +36,14 @@ async def fetch_candles(symbol: str, interval: str, limit: int = 100) -> list[di
         try:
             resp = await client.get(url, params=params)
             data = resp.json()
+            if not isinstance(data, list):
+                if PRINT_DEBUG:
+                    print(f"[CANDLES] {symbol} {interval}: unexpected response: {str(data)[:100]}")
+                return []
             candles = []
             for k in data:
+                if not isinstance(k, (list, tuple)) or len(k) < 6:
+                    continue
                 candles.append({
                     "ts": k[0], "o": float(k[1]), "h": float(k[2]),
                     "l": float(k[3]), "c": float(k[4]), "v": float(k[5]),
