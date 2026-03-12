@@ -23,7 +23,6 @@ from config import (BINANCE_WS_URL, SYMBOLS, CANDLE_FETCH_INTERVAL,
 from telegram_bot import send_telegram
 from proxy_pool import proxy_pool
 
-# How often to refresh deep orderbook (seconds)
 DEEP_OB_INTERVAL = 30
 
 
@@ -51,7 +50,7 @@ class MarketScanner:
         self.candle_ctx = CandleContext()
 
     async def run(self):
-              await proxy_pool.refresh()  # pre-load proxies
+        await proxy_pool.refresh()
         await send_telegram("Scanner started. Monitoring: " + ", ".join(s.upper() for s in SYMBOLS))
         await asyncio.gather(
             self._ws_loop(),
@@ -105,12 +104,12 @@ class MarketScanner:
                 except Exception as e:
                     if PRINT_DEBUG:
                         print(f"[DEEP_OB] error {sym}: {e}")
-                await asyncio.sleep(1)  # rate limit between symbols
+                await asyncio.sleep(1)
             await asyncio.sleep(DEEP_OB_INTERVAL)
 
     async def _level_check_loop(self):
         """Check levels every 15 seconds per symbol."""
-        await asyncio.sleep(10)  # wait for initial data
+        await asyncio.sleep(10)
         while True:
             for sym in SYMBOLS:
                 price = self.last_price.get(sym)
@@ -121,15 +120,12 @@ class MarketScanner:
                 if not bids and not asks:
                     continue
                 try:
-                    # Build levels from deep orderbook
                     new_levels = build_levels(sym, bids, asks, price)
                     self.liq_tracker.bind_to_levels(sym, new_levels)
-                    # Preserve state from old levels
                     old_levels = self.levels_by_sym[sym]
                     if old_levels:
                         new_levels = _merge_state(old_levels, new_levels)
                     self.levels_by_sym[sym] = new_levels
-                    # Process signals
                     await process_levels(sym, price, new_levels, self.candle_ctx)
                 except Exception as e:
                     if PRINT_DEBUG:
