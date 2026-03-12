@@ -1,19 +1,14 @@
 from __future__ import annotations
 import httpx
 from collections import defaultdict
+from proxy_pool import proxy_pool
 from config import (CANDLE_TF_ENTRY, CANDLE_TF_TREND,
                     EMA_FAST, EMA_SLOW, ATR_PERIOD, PRINT_DEBUG)
 
-# Use spot API (works globally, fapi is geo-blocked on US servers)
-CANDLE_URLS = [
-    "https://api.binance.com/api/v3/klines",
-    "https://api1.binance.com/api/v3/klines",
-    "https://api2.binance.com/api/v3/klines",
-]
+CANDLE_URL = "https://api.binance.com/api/v3/klines"
 
 
 def _ema(values: list[float], period: int) -> float:
-    """Simple EMA over the last `period` values."""
     if not values:
         return 0.0
     k = 2 / (period + 1)
@@ -24,7 +19,6 @@ def _ema(values: list[float], period: int) -> float:
 
 
 def _atr(candles: list[dict], period: int) -> float:
-    """Average True Range."""
     trs = []
     for i, c in enumerate(candles):
         h, l, pc = c["h"], c["l"], candles[i-1]["c"] if i > 0 else c["o"]
@@ -36,36 +30,49 @@ def _atr(candles: list[dict], period: int) -> float:
 
 
 async def fetch_candles(symbol: str, interval: str, limit: int = 100) -> list[dict]:
-    """Fetch klines from Binance REST (spot API, works globally)."""
+    """Fetch klines via proxy, fallback to direct."""
     params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
-    async with httpx.AsyncClient(timeout=10) as client:
-        for url in CANDLE_URLS:
+
+    # Try with proxy
+    for attempt in range(3):
+        proxy_url = await proxy_pool.get()
+        if proxy_url:
             try:
-                resp = await client.get(url, params=params)
-                data = resp.json()
-                if not isinstance(data, list):
-                    if PRINT_DEBUG:
-                        print(f"[CANDLES] {symbol} {interval}: unexpected response: {str(data)[:100]}")
-                    continue
-                candles = []
-                for k in data:
-                    if not isinstance(k, (list, tuple)) or len(k) < 6:
-                        continue
-                    candles.append({
-                        "ts": k[0], "o": float(k[1]), "h": float(k[2]),
-                        "l": float(k[3]), "c": float(k[4]), "v": float(k[5]),
-                    })
-                return candles
-            except Exception as e:
-                if PRINT_DEBUG:
-                    print(f"[CANDLES] error {symbol} {interval} {url}: {e}")
-                continue
+                async with httpx.AsyncClient(proxy=proxy_url, timeout=12) as client:
+                    resp = await client.get(CANDLE_URL, params=params)
+                    data = resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        candles = []
+                        for k in data:
+                            if isinstance(k, (list, tuple)) and len(k) >= 6:
+                                candles.append({
+                                    "ts": k[0], "o": float(k[1]), "h": float(k[2]),
+                                    "l": float(k[3]), "c": float(k[4]), "v": float(k[5]),
+                                })
+                        return candles
+                    else:
+                        proxy_pool.remove(proxy_url)
+            except Exception:
+                if proxy_url:
+                    proxy_pool.remove(proxy_url)
+
+    # Fallback direct
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(CANDLE_URL, params=params)
+            data = resp.json()
+            if isinstance(data, list):
+                return [{
+                    "ts": k[0], "o": float(k[1]), "h": float(k[2]),
+                    "l": float(k[3]), "c": float(k[4]), "v": float(k[5]),
+                } for k in data if isinstance(k, (list, tuple)) and len(k) >= 6]
+    except Exception as e:
+        if PRINT_DEBUG:
+            print(f"[CANDLES] error {symbol} {interval}: {e}")
     return []
 
 
 class CandleContext:
-    """Holds candle data + computed indicators per symbol."""
-
     def __init__(self):
         self.entry_candles: dict[str, list[dict]] = defaultdict(list)
         self.trend_candles: dict[str, list[dict]] = defaultdict(list)
@@ -74,7 +81,6 @@ class CandleContext:
         self.atr: dict[str, float] = {}
 
     async def refresh(self, symbol: str) -> None:
-        """Fetch fresh candles and recompute indicators."""
         entry = await fetch_candles(symbol, CANDLE_TF_ENTRY, 60)
         trend = await fetch_candles(symbol, CANDLE_TF_TREND, 60)
         if entry:
