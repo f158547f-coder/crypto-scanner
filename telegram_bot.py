@@ -25,7 +25,6 @@ async def send_telegram(text: str) -> None:
 
 async def send_approaching(symbol: str, side: str, level_price: float,
                            volume_usdt: float, dist_pct: float, strength: float) -> None:
-    """Send 'approaching level' alert."""
     direction = "SUPPORT" if side == "bid" else "RESISTANCE"
     text = (
         f"\u26a0\ufe0f *{symbol.upper()}* approaching {direction}\n"
@@ -40,17 +39,40 @@ async def send_approaching(symbol: str, side: str, level_price: float,
 async def send_signal(symbol: str, direction: str, entry: float,
                       level_price: float, stop_loss: float,
                       tp1: float, tp2: float, reason: str,
-                      risk_pct: float, leverage: int) -> None:
+                      risk_pct: float, leverage: int,
+                      whale_summary: str = "") -> None:
     """Send a LONG/SHORT signal with SL/TP."""
     risk_on_balance = risk_pct * leverage * 100
+    whale_line = f"\nWhalePortal: {whale_summary}" if whale_summary else ""
     text = (
-        f"\U0001f7e2 *{symbol.upper()}* — *{direction}*\n"
+        f"\U0001f7e2 *{symbol.upper()}* -- *{direction}*\n"
         f"Entry: `{entry:.4f}`\n"
         f"Level: `{level_price:.4f}`\n"
         f"Stop: `{stop_loss:.4f}` (~{risk_pct*100:.2f}%)\n"
-        f"TP1: `{tp1:.4f}` (RR 1:{int(risk_pct and (abs(tp1-entry)/abs(entry-stop_loss)) or 0)})\n"
-        f"TP2: `{tp2:.4f}` (RR 1:{int(risk_pct and (abs(tp2-entry)/abs(entry-stop_loss)) or 0)})\n"
+        f"TP1: `{tp1:.4f}`\n"
+        f"TP2: `{tp2:.4f}`\n"
         f"Leverage: `{leverage}x` (risk ~{risk_on_balance:.1f}% balance)\n"
-        f"Reason: {reason}"
+        f"Reason: {reason}{whale_line}"
+    )
+    await send_telegram(text)
+
+
+async def send_tc_signal(symbol: str, direction: str, entry: float,
+                         stop_loss: float, tp1: float, tp2: float,
+                         wall_price: float, wall_type: str, wall_usdt: float,
+                         pattern: str, timeframe: str, vol_ratio: float,
+                         risk_pct: float, leverage: int,
+                         whale_summary: str = "") -> None:
+    """Send TensorCharts-style signal."""
+    whale_line = f"\nWhalePortal: {whale_summary}" if whale_summary else ""
+    text = (
+        f"\U0001f4ca *[TensorCharts]* *{symbol.upper()}* -- *{direction}*\n"
+        f"Entry: `{entry:.4f}`\n"
+        f"Wall: `{wall_price:.4f}` ({wall_type}, ${wall_usdt/1000:.0f}k)\n"
+        f"Pattern: `{pattern}` on `{timeframe}` (vol {vol_ratio:.1f}x)\n"
+        f"Stop: `{stop_loss:.4f}` (~{risk_pct*100:.2f}%)\n"
+        f"TP1: `{tp1:.4f}`\n"
+        f"TP2: `{tp2:.4f}`\n"
+        f"Leverage: `{leverage}x`{whale_line}"
     )
     await send_telegram(text)
