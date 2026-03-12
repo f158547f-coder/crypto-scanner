@@ -43,6 +43,7 @@ USE_CANDLE_PATTERNS = True
 USE_TREND_FILTER = True
 USE_FALSE_BREAK = True
 USE_VOLATILITY_FILTER = True
+USE_AI_FILTER = True              # AI validation via Gemini
 USE_LIQUIDATION_FILTER = False   # disabled - depth20 rarely has liq data nearby
 # --- Telegram ---
 TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
