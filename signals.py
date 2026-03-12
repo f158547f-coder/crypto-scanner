@@ -4,6 +4,7 @@ from typing import List
 from levels import Level, calc_strength
 from patterns import check_entry_filters
 from ai_filter import filter_signal
+from whale_filter import check_whale_filter
 from context_candles import CandleContext
 from telegram_bot import send_approaching, send_signal
 from config import (
@@ -149,11 +150,20 @@ async def process_levels(symbol: str, price: float, levels: List[Level],
                     risk_pct = abs(entry - stop_loss) / max(entry, 1e-9)
                     reason = ai_result.get("reason", reason)
 
+                    # WhalePortal filter
+        whale_passed, whale_reason, whale_summary = await check_whale_filter(symbol, direction)
+        if not whale_passed:
+            if PRINT_DEBUG:
+                print(f"[WHALE REJECT] {symbol} {direction}: {whale_reason}")
+            lvl.state = "SIGNALLED"
+            continue
+
             await send_signal(
                 symbol=symbol, direction=direction, entry=entry,
                 level_price=lvl.price, stop_loss=stop_loss,
                 tp1=tp1, tp2=tp2, reason=reason,
                 risk_pct=risk_pct, leverage=LEVERAGE,
+                            whale_summary=whale_summary,
             )
 
             lvl.state = "SIGNALLED"
