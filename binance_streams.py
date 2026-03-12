@@ -128,7 +128,7 @@ class MarketScanner:
                         new_levels = _merge_state(old_levels, new_levels)
                     self.levels_by_sym[sym] = new_levels
                     await process_levels(sym, price, new_levels, self.candle_ctx)
-                                      await check_tc_signals(sym, price, bids, asks)
+                  await check_tc_signals(sym, price, bids, asks)
                 except Exception as e:
                     if PRINT_DEBUG:
                         print(f"[CHECK] error {sym}: {e}")
