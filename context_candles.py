@@ -1,8 +1,15 @@
 from __future__ import annotations
 import httpx
 from collections import defaultdict
-from config import (BINANCE_REST_URL, CANDLE_TF_ENTRY, CANDLE_TF_TREND,
+from config import (CANDLE_TF_ENTRY, CANDLE_TF_TREND,
                     EMA_FAST, EMA_SLOW, ATR_PERIOD, PRINT_DEBUG)
+
+# Use spot API (works globally, fapi is geo-blocked on US servers)
+CANDLE_URLS = [
+    "https://api.binance.com/api/v3/klines",
+    "https://api1.binance.com/api/v3/klines",
+    "https://api2.binance.com/api/v3/klines",
+]
 
 
 def _ema(values: list[float], period: int) -> float:
@@ -29,30 +36,31 @@ def _atr(candles: list[dict], period: int) -> float:
 
 
 async def fetch_candles(symbol: str, interval: str, limit: int = 100) -> list[dict]:
-    """Fetch klines from Binance REST."""
-    url = f"{BINANCE_REST_URL}/fapi/v1/klines"
+    """Fetch klines from Binance REST (spot API, works globally)."""
     params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
     async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            resp = await client.get(url, params=params)
-            data = resp.json()
-            if not isinstance(data, list):
-                if PRINT_DEBUG:
-                    print(f"[CANDLES] {symbol} {interval}: unexpected response: {str(data)[:100]}")
-                return []
-            candles = []
-            for k in data:
-                if not isinstance(k, (list, tuple)) or len(k) < 6:
+        for url in CANDLE_URLS:
+            try:
+                resp = await client.get(url, params=params)
+                data = resp.json()
+                if not isinstance(data, list):
+                    if PRINT_DEBUG:
+                        print(f"[CANDLES] {symbol} {interval}: unexpected response: {str(data)[:100]}")
                     continue
-                candles.append({
-                    "ts": k[0], "o": float(k[1]), "h": float(k[2]),
-                    "l": float(k[3]), "c": float(k[4]), "v": float(k[5]),
-                })
-            return candles
-        except Exception as e:
-            if PRINT_DEBUG:
-                print(f"[CANDLES] error {symbol} {interval}: {e}")
-            return []
+                candles = []
+                for k in data:
+                    if not isinstance(k, (list, tuple)) or len(k) < 6:
+                        continue
+                    candles.append({
+                        "ts": k[0], "o": float(k[1]), "h": float(k[2]),
+                        "l": float(k[3]), "c": float(k[4]), "v": float(k[5]),
+                    })
+                return candles
+            except Exception as e:
+                if PRINT_DEBUG:
+                    print(f"[CANDLES] error {symbol} {interval} {url}: {e}")
+                continue
+    return []
 
 
 class CandleContext:
