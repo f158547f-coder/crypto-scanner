@@ -21,6 +21,7 @@ from signals import process_levels
 from config import (BINANCE_WS_URL, SYMBOLS, CANDLE_FETCH_INTERVAL,
                     PRINT_DEBUG, LEVEL_MERGE_PCT)
 from telegram_bot import send_telegram
+from proxy_pool import proxy_pool
 
 # How often to refresh deep orderbook (seconds)
 DEEP_OB_INTERVAL = 30
@@ -50,6 +51,7 @@ class MarketScanner:
         self.candle_ctx = CandleContext()
 
     async def run(self):
+              await proxy_pool.refresh()  # pre-load proxies
         await send_telegram("Scanner started. Monitoring: " + ", ".join(s.upper() for s in SYMBOLS))
         await asyncio.gather(
             self._ws_loop(),
