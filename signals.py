@@ -3,6 +3,7 @@ import time
 from typing import List
 from levels import Level, calc_strength
 from patterns import check_entry_filters
+from ai_filter import filter_signal
 from context_candles import CandleContext
 from telegram_bot import send_approaching, send_signal
 from config import (
@@ -10,6 +11,7 @@ from config import (
     LEVEL_MIN_STRENGTH, LEVEL_COOLDOWN_SEC,
     LIQ_MIN_USDT, USE_LIQUIDATION_FILTER,
     STOP_LOSS_PCT, TP1_RR, TP2_RR, LEVERAGE, PRINT_DEBUG,
+    USE_AI_FILTER,
 )
 
 # Global cooldown tracker: {(symbol, side, rounded_price): last_alert_ts}
@@ -116,6 +118,36 @@ async def process_levels(symbol: str, price: float, levels: List[Level],
                 tp2 = entry - risk * TP2_RR
 
             risk_pct = abs(entry - stop_loss) / max(entry, 1e-9)
+
+                        # AI filter (optional)
+            if USE_AI_FILTER:
+                ai_result = await filter_signal(
+                    symbol=symbol, direction=direction,
+                    entry=entry, stop_loss=stop_loss,
+                    tp1=tp1, tp2=tp2,
+                    level_price=lvl.price,
+                    level_strength=lvl.strength,
+                    volume_anomaly=ctx.volume_ratio if ctx else 1.0,
+                    liquidation_cluster=lvl.liq_short_usdt + lvl.liq_long_usdt,
+                    ema_fast=ctx.ema_fast if ctx else 0,
+                    ema_slow=ctx.ema_slow if ctx else 0,
+                    atr=ctx.atr if ctx else 0,
+                    current_price=price,
+                )
+                if ai_result and not ai_result.get("approved", False):
+                    if PRINT_DEBUG:
+                        print(f"[AI REJECT] {symbol} {direction}: {ai_result.get('reason', '')}")
+                    lvl.state = "SIGNALLED"
+                    continue
+                # Apply AI corrections if any
+                if ai_result and ai_result.get("corrected", False):
+                    direction = ai_result.get("direction", direction)
+                    entry = ai_result.get("entry", entry)
+                    stop_loss = ai_result.get("stop_loss", stop_loss)
+                    tp1 = ai_result.get("tp1", tp1)
+                    tp2 = ai_result.get("tp2", tp2)
+                    risk_pct = abs(entry - stop_loss) / max(entry, 1e-9)
+                    reason = ai_result.get("reason", reason)
 
             await send_signal(
                 symbol=symbol, direction=direction, entry=entry,
