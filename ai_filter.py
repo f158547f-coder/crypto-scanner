@@ -1,7 +1,7 @@
-"""AI signal filter using Google Gemini.
+"""AI signal filter with multi-provider fallback.
 
-Sends signal context to Gemini for validation.
-Gemini can approve, reject, or correct the signal (adjust SL/TP/direction).
+Provider priority: Gemini -> Groq -> OpenRouter.
+If primary fails, automatically tries next provider.
 """
 from __future__ import annotations
 import json
@@ -9,8 +9,15 @@ import os
 import httpx
 from config import PRINT_DEBUG
 
+# --- API Keys ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+
+# --- Endpoints ---
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 SYSTEM_PROMPT = """You are a professional crypto futures trading analyst AI.
 You receive a trading signal with market context and must validate it.
@@ -32,135 +39,161 @@ Always respond with ONLY valid JSON (no markdown, no explanation):
   "approved": true/false,
   "reason": "brief explanation",
   "corrected": false,
-  "direction": "LONG" or "SHORT",
-  "entry": float,
-  "stop_loss": float,
-  "tp1": float,
-  "tp2": float
+  "direction": "LONG/SHORT",
+  "entry": 0.0,
+  "stop_loss": 0.0,
+  "tp1": 0.0,
+  "tp2": 0.0
 }
 
-If corrected=true, use your corrected values for entry/sl/tp.
-If corrected=false, the original values will be used.
-"""
-
-
-async def ai_validate_signal(
-    symbol: str,
-    direction: str,
-    entry: float,
-    level_price: float,
-    stop_loss: float,
-    tp1: float,
-    tp2: float,
-    level_volume: float,
-    level_strength: float,
-    ema_fast: float,
-    ema_slow: float,
-    atr: float,
-    liq_long: float,
-    liq_short: float,
-    candle_pattern: str,
-) -> dict | None:
-    """Send signal to Gemini for AI validation.
-
-    Returns dict with keys: approved, reason, corrected, direction, entry, stop_loss, tp1, tp2
-    Returns None on API error (signal proceeds without AI filter).
-    """
-    if not GEMINI_API_KEY:
-        if PRINT_DEBUG:
-            print("[AI] no GEMINI_API_KEY, skipping filter")
-        return None
-
-    prompt = f"""Validate this crypto futures signal:
-
-Symbol: {symbol.upper()}
-Direction: {direction}
-Entry: {entry:.6f}
-Level price: {level_price:.6f}
-Stop loss: {stop_loss:.6f}
-TP1: {tp1:.6f}
-TP2: {tp2:.6f}
-Leverage: 20x
-
-Market context:
-- Level volume (USDT): {level_volume:,.0f}
-- Level strength score: {level_strength:.2f}
-- EMA fast: {ema_fast:.6f}
-- EMA slow: {ema_slow:.6f}
-- ATR: {atr:.6f}
-- Liquidation long nearby: {liq_long:,.0f} USDT
-- Liquidation short nearby: {liq_short:,.0f} USDT
-- Candle pattern: {candle_pattern}
-- Trend: {'BULLISH' if ema_fast > ema_slow else 'BEARISH' if ema_slow > ema_fast else 'NEUTRAL'}
-
-Risk analysis:
-- Risk per trade at 20x: {abs(entry - stop_loss) / entry * 20 * 100:.1f}% of margin
-- R:R to TP1: {abs(tp1 - entry) / max(abs(entry - stop_loss), 1e-9):.2f}
-- R:R to TP2: {abs(tp2 - entry) / max(abs(entry - stop_loss), 1e-9):.2f}
-
+If corrected=true, fill in corrected values. If corrected=false, values are ignored.
 Respond with JSON only."""
 
-    payload = {
-        "contents": [{
-            "parts": [{"text": SYSTEM_PROMPT + "\n\n" + prompt}]
-        }],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 500,
-        }
-    }
 
+def _parse_ai_response(text: str, symbol: str, direction: str) -> dict | None:
+    """Parse JSON from AI response text, stripping markdown if present."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+    try:
+        result = json.loads(text)
+        if PRINT_DEBUG:
+            approved = result.get("approved", False)
+            corrected = result.get("corrected", False)
+            reason = result.get("reason", "")
+            print(f"[AI] {symbol} {direction}: "
+                  f"{'APPROVED' if approved else 'REJECTED'}"
+                  f"{' (corrected)' if corrected else ''} - {reason}")
+        return result
+    except json.JSONDecodeError as e:
+        if PRINT_DEBUG:
+            print(f"[AI] JSON parse error: {e}, text: {text[:200]}")
+        return None
+
+
+async def _call_gemini(prompt: str, symbol: str, direction: str) -> dict | None:
+    """Call Google Gemini API."""
+    if not GEMINI_API_KEY:
+        return None
+    payload = {
+        "contents": [{"parts": [{"text": SYSTEM_PROMPT + "\n\n" + prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 500},
+    }
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-                json=payload,
-            )
+            resp = await client.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", json=payload)
             data = resp.json()
-
-            # Extract text from Gemini response
-            text = ""
             candidates = data.get("candidates", [])
             if candidates:
                 parts = candidates[0].get("content", {}).get("parts", [])
                 if parts:
                     text = parts[0].get("text", "")
-
-            if not text:
-                if PRINT_DEBUG:
-                    print(f"[AI] empty response: {str(data)[:200]}")
-                return None
-
-            # Parse JSON from response (strip markdown if present)
-            text = text.strip()
-            if text.startswith("```"):
-                text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-
-            result = json.loads(text)
-
+                    if text:
+                        return _parse_ai_response(text, symbol, direction)
             if PRINT_DEBUG:
-                approved = result.get("approved", False)
-                corrected = result.get("corrected", False)
-                reason = result.get("reason", "")
-                print(f"[AI] {symbol} {direction}: "
-                      f"{'APPROVED' if approved else 'REJECTED'}"
-                      f"{' (corrected)' if corrected else ''} - {reason}")
-
-            return result
-
-    except json.JSONDecodeError as e:
-        if PRINT_DEBUG:
-            print(f"[AI] JSON parse error: {e}, text: {text[:200]}")
-        return None
+                print(f"[AI:Gemini] empty response: {str(data)[:200]}")
     except Exception as e:
         if PRINT_DEBUG:
-            print(f"[AI] error: {e}")
-        return None
+            print(f"[AI:Gemini] error: {e}")
+    return None
 
-  
+
+async def _call_groq(prompt: str, symbol: str, direction: str) -> dict | None:
+    """Call Groq API (OpenAI-compatible)."""
+    if not GROQ_API_KEY:
+        return None
+    payload = {
+        "model": "llama-3.1-70b-versatile",
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 500,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                GROQ_URL,
+                json=payload,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            )
+            data = resp.json()
+            choices = data.get("choices", [])
+            if choices:
+                text = choices[0].get("message", {}).get("content", "")
+                if text:
+                    return _parse_ai_response(text, symbol, direction)
+            if PRINT_DEBUG:
+                print(f"[AI:Groq] empty response: {str(data)[:200]}")
+    except Exception as e:
+        if PRINT_DEBUG:
+            print(f"[AI:Groq] error: {e}")
+    return None
+
+
+async def _call_openrouter(prompt: str, symbol: str, direction: str) -> dict | None:
+    """Call OpenRouter API (OpenAI-compatible)."""
+    if not OPENROUTER_API_KEY:
+        return None
+    payload = {
+        "model": "meta-llama/llama-3.1-70b-instruct",
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 500,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                OPENROUTER_URL,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "HTTP-Referer": "https://github.com/f158547f-coder/crypto-scanner",
+                    "X-Title": "CryptoScanner",
+                },
+            )
+            data = resp.json()
+            choices = data.get("choices", [])
+            if choices:
+                text = choices[0].get("message", {}).get("content", "")
+                if text:
+                    return _parse_ai_response(text, symbol, direction)
+            if PRINT_DEBUG:
+                print(f"[AI:OpenRouter] empty response: {str(data)[:200]}")
+    except Exception as e:
+        if PRINT_DEBUG:
+            print(f"[AI:OpenRouter] error: {e}")
+    return None
+
+
+# Provider chain: try in order, stop on first success
+_PROVIDERS = [
+    ("Gemini", _call_gemini),
+    ("Groq", _call_groq),
+    ("OpenRouter", _call_openrouter),
+]
+
+
+async def _call_ai(prompt: str, symbol: str, direction: str) -> dict | None:
+    """Try all AI providers in order until one succeeds."""
+    for name, fn in _PROVIDERS:
+        result = await fn(prompt, symbol, direction)
+        if result is not None:
+            if PRINT_DEBUG:
+                print(f"[AI] used provider: {name}")
+            return result
+    if PRINT_DEBUG:
+        print(f"[AI] all providers failed for {symbol} {direction}")
+    return None
+
+
 async def filter_signal(
     symbol: str,
     direction: str,
@@ -178,13 +211,12 @@ async def filter_signal(
     current_price: float,
 ) -> dict | None:
     """Filter a trading signal through AI validation.
-    
     Returns dict with approved/corrected fields, or None on error.
     """
-    if not GEMINI_API_KEY:
+    if not (GEMINI_API_KEY or GROQ_API_KEY or OPENROUTER_API_KEY):
         if PRINT_DEBUG:
-            print("[AI] No GEMINI_API_KEY, skipping filter")
-        return {"approved": True, "reason": "no AI key", "corrected": False}
+            print("[AI] No API keys set, skipping filter")
+        return {"approved": True, "reason": "no AI keys", "corrected": False}
 
     trend = "BULLISH" if ema_fast > ema_slow else "BEARISH"
     risk_reward = abs(tp1 - entry) / abs(entry - stop_loss) if abs(entry - stop_loss) > 0 else 0
@@ -209,4 +241,4 @@ Leverage: 20x
 
 Respond with JSON only."""
 
-    return await _call_gemini(prompt, symbol, direction)
+    return await _call_ai(prompt, symbol, direction)
