@@ -1,4 +1,14 @@
-from collections import defaultdict
+"""Order book management + deep REST fetcher."""
+from __future__ import annotations
+import httpx
+from config import PRINT_DEBUG
+
+# Spot API endpoints (work globally, no geo-block)
+DEPTH_URLS = [
+    "https://api.binance.com/api/v3/depth",
+    "https://api1.binance.com/api/v3/depth",
+    "https://api2.binance.com/api/v3/depth",
+]
 
 
 class OrderBook:
@@ -32,12 +42,46 @@ class OrderBook:
         bb, ba = self.best_bid(), self.best_ask()
         if bb and ba:
             return (bb + ba) / 2
-        return None
+        return bb or ba
 
-    def top_bids(self, n: int = 20) -> list[tuple[float, float]]:
-        """Return top-N bid levels sorted desc by price."""
-        return sorted(self.bids.items(), key=lambda x: -x[0])[:n]
+    def top_bids(self, n: int = 10) -> list[tuple[float, float]]:
+        return sorted(self.bids.items(), reverse=True)[:n]
 
-    def top_asks(self, n: int = 20) -> list[tuple[float, float]]:
-        """Return top-N ask levels sorted asc by price."""
-        return sorted(self.asks.items(), key=lambda x: x[0])[:n]
+    def top_asks(self, n: int = 10) -> list[tuple[float, float]]:
+        return sorted(self.asks.items())[:n]
+
+
+async def fetch_deep_orderbook(symbol: str, limit: int = 5000) -> tuple[dict, dict]:
+    """Fetch deep order book via Binance spot REST API.
+
+    Returns (bids_dict, asks_dict) where key=price, value=qty.
+    Spot API limit max is 5000. This gives us full depth.
+    """
+    params = {"symbol": symbol.upper(), "limit": limit}
+    async with httpx.AsyncClient(timeout=15) as client:
+        for url in DEPTH_URLS:
+            try:
+                resp = await client.get(url, params=params)
+                data = resp.json()
+                if "bids" not in data or "asks" not in data:
+                    if PRINT_DEBUG:
+                        print(f"[DEPTH] {symbol}: unexpected response: {str(data)[:100]}")
+                    continue
+                bids = {}
+                for p, q in data["bids"]:
+                    price, qty = float(p), float(q)
+                    if qty > 0:
+                        bids[price] = qty
+                asks = {}
+                for p, q in data["asks"]:
+                    price, qty = float(p), float(q)
+                    if qty > 0:
+                        asks[price] = qty
+                if PRINT_DEBUG:
+                    print(f"[DEPTH] {symbol}: {len(bids)} bids, {len(asks)} asks")
+                return bids, asks
+            except Exception as e:
+                if PRINT_DEBUG:
+                    print(f"[DEPTH] error {symbol} {url}: {e}")
+                continue
+    return {}, {}
